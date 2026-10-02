@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from src.retrieval.models import RetrievedChunk
 
@@ -17,3 +17,12 @@ class RAGResult:
     used_chunks: List[RetrievedChunk] = field(default_factory=list)
     prompt: str = ""
     meta: Dict[str, Any] = field(default_factory=dict)
+
+    # Поля Task 23 (reranking + query rewrite).
+    original_query: str = ""
+    rewritten_query: Optional[str] = None
+    chunks_before_rerank: List[RetrievedChunk] = field(default_factory=list)
+    chunks_after_rerank: List[RetrievedChunk] = field(default_factory=list)
+    rewrite_meta: Dict[str, Any] = field(default_factory=dict)
+    rerank_meta: Dict[str, Any] = field(default_factory=dict)
+

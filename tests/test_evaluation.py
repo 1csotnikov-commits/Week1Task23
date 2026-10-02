@@ -1,4 +1,4 @@
-"""Тесты evaluation (вопросы, эвристики, прогон, отчёты)."""
+"""Тесты evaluation (вопросы, эвристики, мультирежимный прогон, отчёты)."""
 
 import sys
 import tempfile
@@ -8,8 +8,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.evaluation.comparator import (  # noqa: E402
-    aggregate,
-    evaluate_question,
+    aggregate_modes,
+    evaluate_mode,
     is_hit,
     jaccard,
     keyword_overlap,
@@ -18,11 +18,10 @@ from src.evaluation.comparator import (  # noqa: E402
 )
 from src.evaluation.questions import Question, load_questions, save_questions  # noqa: E402
 from src.evaluation.report import render_report  # noqa: E402
-from src.evaluation.runner import QuestionResult, build_payload, run_evaluation, save_results  # noqa: E402
+from src.evaluation.runner import QuestionResult, build_payload, save_results  # noqa: E402
 from src.models import Chunk  # noqa: E402
 from src.rag.models import RAGResult  # noqa: E402
 from src.retrieval.models import RetrievedChunk  # noqa: E402
-from tests.fakes import FakeLLM  # noqa: E402
 
 
 def make_chunk(source: str = "a.md", section: str = "") -> RetrievedChunk:
@@ -30,6 +29,17 @@ def make_chunk(source: str = "a.md", section: str = "") -> RetrievedChunk:
         chunk=Chunk(chunk_id="c0", source=source, title="a", text="текст", start_char=0, end_char=4, strategy="fixed", section=section),
         score=0.9,
         rank=1,
+    )
+
+
+def make_rag_result(answer: str, chunks, mode: str = "rag") -> RAGResult:
+    return RAGResult(
+        answer=answer,
+        mode=mode,
+        used_chunks=chunks,
+        chunks_before_rerank=chunks,
+        chunks_after_rerank=chunks,
+        meta={"elapsed_ms": 10, "tokens_in": 20, "tokens_out": 5},
     )
 
 
@@ -69,52 +79,41 @@ class TestEvaluation(unittest.TestCase):
 
     def test_evaluate_and_aggregate(self):
         q = Question("q01", "Вопрос", "ответ", ["a.md"])
-        rag = RAGResult(
-            answer="Это ответ на вопрос",
-            mode="rag",
-            used_chunks=[make_chunk("a.md", "S")],
-            prompt="",
-            meta={"elapsed_ms": 10, "tokens_in": 20, "tokens_out": 5, "top_k": 1, "num_chunks": 1},
-        )
-        no_rag = RAGResult(
-            answer="Не знаю",
-            mode="no_rag",
-            used_chunks=[],
-            prompt="",
-            meta={"elapsed_ms": 5, "tokens_in": 3, "tokens_out": 2},
-        )
-        row = evaluate_question(QuestionResult(q, rag, no_rag))
-        self.assertTrue(row["rag"]["hit"])
-        self.assertFalse(row["no_rag"]["hit"])
-        agg = aggregate([row])
+        rag = make_rag_result("Это ответ на вопрос", [make_chunk("a.md", "S")])
+        no_rag = make_rag_result("Не знаю", [], "no_rag")
+
+        row_rag = evaluate_mode(rag, q)
+        self.assertTrue(row_rag["hit"])
+        self.assertEqual(row_rag["num_chunks_after"], 1)
+
+        rows = [{"id": "q01", "modes": {"rag": evaluate_mode(rag, q), "no_rag": evaluate_mode(no_rag, q)}}]
+        agg = aggregate_modes(rows)
         self.assertEqual(agg["num_questions"], 1)
-        self.assertEqual(agg["rag_hit_rate"], 1.0)
-        self.assertEqual(agg["source_hit_rate"], 1.0)
+        self.assertEqual(agg["per_mode"]["rag"]["hit_rate"], 1.0)
+        self.assertEqual(agg["per_mode"]["no_rag"]["hit_rate"], 0.0)
 
     def test_render_formats(self):
-        payload = build_payload(
-            [
-                QuestionResult(
-                    Question("q01", "Вопрос", "ответ", ["a.md"]),
-                    RAGResult("ответ", "rag", [make_chunk("a.md")], "", {"elapsed_ms": 1, "tokens_in": 2, "tokens_out": 1}),
-                    RAGResult("не знаю", "no_rag", [], "", {"elapsed_ms": 1, "tokens_in": 1, "tokens_out": 1}),
-                )
-            ],
-            index_name="idx",
-        )
+        q = Question("q01", "Вопрос", "ответ", ["a.md"])
+        rag = make_rag_result("ответ", [make_chunk("a.md")])
+        no_rag = make_rag_result("не знаю", [], "no_rag")
+        payload = build_payload([QuestionResult(q, {"rag": rag, "no_rag": no_rag})], index_name="idx")
         for fmt in ("console", "markdown", "json"):
             out = render_report(payload, fmt)
             self.assertTrue(out.strip())
 
     def test_save_results(self):
         q = Question("q01", "Вопрос", "ответ", ["a.md"])
-        rag = RAGResult("ответ", "rag", [make_chunk("a.md")], "", {"elapsed_ms": 1, "tokens_in": 2, "tokens_out": 1})
-        no_rag = RAGResult("не знаю", "no_rag", [], "", {"elapsed_ms": 1, "tokens_in": 1, "tokens_out": 1})
-        json_path, md_path, payload = save_results([QuestionResult(q, rag, no_rag)], self.root / "results", "idx")
+        rag = make_rag_result("ответ", [make_chunk("a.md")])
+        no_rag = make_rag_result("не знаю", [], "no_rag")
+        json_path, md_path, payload = save_results(
+            [QuestionResult(q, {"rag": rag, "no_rag": no_rag})], self.root / "results", "idx"
+        )
         self.assertTrue(json_path.exists())
         self.assertTrue(md_path.exists())
         self.assertEqual(payload["index_name"], "idx")
+        self.assertEqual(payload["modes"], ["rag", "no_rag"])
 
 
 if __name__ == "__main__":
     unittest.main()
+

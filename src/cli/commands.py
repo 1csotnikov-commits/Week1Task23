@@ -11,6 +11,9 @@ from typing import Any, Dict, List
 STRATEGY_CHOICES = ("fixed", "structural")
 FORMAT_CHOICES = ("console", "json", "csv", "markdown")
 REPORT_FORMAT_CHOICES = ("console", "markdown", "json")
+RERANKER_CHOICES = ("threshold", "similarity", "cross_encoder", "none")
+REWRITER_CHOICES = ("none", "heuristic", "llm")
+EVAL_MODE_CHOICES = ("no_rag", "rag_no_rerank", "rag", "rag_no_rewrite", "rag_full")
 
 # Структура команд. Используется и для /help, и для валидации в парсере.
 COMMANDS: Dict[str, Dict[str, Any]] = {
@@ -98,13 +101,16 @@ COMMANDS: Dict[str, Dict[str, Any]] = {
     },
     "/ask": {
         "description": "Задать вопрос и получить RAG-ответ с источниками",
-        "usage": "/ask \"<вопрос>\" [--index <index_name>] [--top-k N] [--debug]",
-        "example": "/ask \"Какие стратегии чанкинга есть?\" --index my_index",
+        "usage": "/ask \"<вопрос>\" [--index <index_name>] [--top-k-retrieve N] [--top-k-after-rerank N] [--reranker threshold|similarity|cross_encoder|none] [--rewrite none|heuristic|llm] [--debug]",
+        "example": "/ask \"Какие стратегии чанкинга есть?\" --index my_index --reranker threshold",
         "arguments": [{"name": "question", "required": True, "description": "текст вопроса (в кавычках)"}],
         "flags": [
             {"name": "index", "description": "имя индекса (по умолчанию из конфига rag.default_index)"},
-            {"name": "top-k", "description": "число чанков для контекста"},
-            {"name": "debug", "description": "показать полный промт и все использованные чанки"},
+            {"name": "top-k-retrieve", "description": "сколько чанков достаём из FAISS"},
+            {"name": "top-k-after-rerank", "description": "сколько чанков оставляем после реранкера"},
+            {"name": "reranker", "choices": RERANKER_CHOICES, "description": "реранкер/фильтр"},
+            {"name": "rewrite", "choices": REWRITER_CHOICES, "description": "переписывание запроса"},
+            {"name": "debug", "description": "показать полный промт, чанки до/после rerank, rewrite"},
         ],
     },
     "/ask-raw": {
@@ -115,14 +121,46 @@ COMMANDS: Dict[str, Dict[str, Any]] = {
         "flags": [{"name": "debug", "description": "показать полный промт"}],
     },
     "/ask-compare": {
-        "description": "Показать оба режима (RAG и No-RAG) рядом",
-        "usage": "/ask-compare \"<вопрос>\" [--index <index_name>] [--top-k N]",
+        "description": "Показать режимы рядом: no_rag | rag_no_rerank | rag (с reranker)",
+        "usage": "/ask-compare \"<вопрос>\" [--index <index_name>] [--top-k-retrieve N]",
         "example": "/ask-compare \"Какая модель эмбеддингов используется?\" --index my_index",
         "arguments": [{"name": "question", "required": True, "description": "текст вопроса (в кавычках)"}],
         "flags": [
             {"name": "index", "description": "имя индекса (по умолчанию из конфига rag.default_index)"},
-            {"name": "top-k", "description": "число чанков для контекста"},
+            {"name": "top-k-retrieve", "description": "сколько чанков достаём из FAISS"},
         ],
+    },
+    "/rerank": {
+        "description": "Показать результат реранкера без обращения к LLM",
+        "usage": "/rerank test \"<запрос>\" [--index <index_name>] [--top-k-retrieve N] [--reranker threshold|similarity|cross_encoder|none]",
+        "example": "/rerank test \"Что такое ТС ПИоТ\" --index my_index --reranker threshold",
+        "subcommands": {
+            "test": {
+                "description": "Список чанков до/после фильтрации и сколько отсечено",
+                "usage": "/rerank test \"<запрос>\" [--index <index_name>] [--top-k-retrieve N] [--reranker ...]",
+                "example": "/rerank test \"Что такое ТС ПИоТ\" --index my_index",
+                "arguments": [{"name": "query", "required": True, "description": "текст запроса (в кавычках)"}],
+                "flags": [
+                    {"name": "index", "description": "имя индекса"},
+                    {"name": "top-k-retrieve", "description": "сколько чанков достаём из FAISS"},
+                    {"name": "reranker", "choices": RERANKER_CHOICES, "description": "реранкер/фильтр"},
+                ],
+            },
+        },
+    },
+    "/rewrite": {
+        "description": "Показать результат query rewrite без обращения к retrieval",
+        "usage": "/rewrite test \"<запрос>\" [--provider none|heuristic|llm]",
+        "example": "/rewrite test \"Что такое ТС ПИоТ\" --provider heuristic",
+        "subcommands": {
+            "test": {
+                "description": "Оригинальный и переписанный запрос",
+                "usage": "/rewrite test \"<запрос>\" [--provider none|heuristic|llm]",
+                "example": "/rewrite test \"Что такое ТС ПИоТ\" --provider heuristic",
+                "arguments": [{"name": "query", "required": True, "description": "текст запроса (в кавычках)"}],
+                "flags": [{"name": "provider", "choices": REWRITER_CHOICES, "description": "провайдер переписывания"}],
+            },
+        },
     },
     "/eval": {
         "description": "Оценка качества: генерация вопросов, прогон, отчёт",
@@ -141,13 +179,16 @@ COMMANDS: Dict[str, Dict[str, Any]] = {
                 ],
             },
             "run": {
-                "description": "Прогнать вопросы в режимах RAG и No-RAG и сохранить результаты",
-                "usage": "/eval run <index_name> [--questions <path>] [--top-k N]",
-                "example": "/eval run my_index --top-k 5",
+                "description": "Прогнать вопросы в нескольких режимах и сохранить результаты",
+                "usage": "/eval run <index_name> [--questions <path>] [--mode <mode>] [--compare-all] [--top-k-retrieve N] [--top-k-after-rerank N]",
+                "example": "/eval run my_index --top-k-retrieve 10 --top-k-after-rerank 5",
                 "arguments": [{"name": "index_name", "required": True, "description": "имя индекса"}],
                 "flags": [
                     {"name": "questions", "description": "путь к questions.yaml (по умолчанию из конфига)"},
-                    {"name": "top-k", "description": "число чанков для контекста"},
+                    {"name": "mode", "choices": EVAL_MODE_CHOICES, "description": "один режим (по умолчанию прогоняются 3 базовых)"},
+                    {"name": "compare-all", "description": "прогнать все 5 режимов"},
+                    {"name": "top-k-retrieve", "description": "сколько чанков достаём из FAISS"},
+                    {"name": "top-k-after-rerank", "description": "сколько чанков оставляем после реранкера"},
                 ],
             },
             "report": {

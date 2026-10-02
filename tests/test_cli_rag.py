@@ -1,4 +1,4 @@
-"""Тесты новых CLI-команд RAG (/ask, /ask-raw, /ask-compare, /eval report)."""
+"""Тесты новых CLI-команд RAG (/ask, /ask-raw, /ask-compare, /rerank, /rewrite, /eval)."""
 
 import sys
 import tempfile
@@ -24,12 +24,17 @@ class TestCLIRag(unittest.TestCase):
         self.config = Config({
             "index": {"path": str(self.index_root)},
             "documents": {"path": str(self.root / "docs"), "extensions": [".txt"]},
-            "rag": {"default_index": "idx", "top_k": 3},
-            "llm": {"provider": "deepseek", "model": "deepseek-chat"},
-            "evaluation": {
-                "questions": str(self.root / "questions.yaml"),
-                "results_dir": str(self.root / "results"),
+            "rag": {"default_index": "idx"},
+            "retrieval": {"top_k_retrieve": 10},
+            "reranking": {
+                "enabled": True,
+                "provider": "threshold",
+                "top_k_after_rerank": 5,
+                "threshold": {"min_score": 0.0, "min_keep": 1},
             },
+            "rewrite": {"enabled": False, "provider": "none"},
+            "llm": {"provider": "deepseek", "model": "deepseek-chat"},
+            "evaluation": {"questions": str(self.root / "questions.yaml"), "results_dir": str(self.root / "results")},
         })
         self.app = App(self.config)
 
@@ -46,8 +51,8 @@ class TestCLIRag(unittest.TestCase):
     def test_help_lists_new_commands(self):
         out = main.build_help()
         self.assertIn("/ask", out)
-        self.assertIn("/ask-raw", out)
-        self.assertIn("/ask-compare", out)
+        self.assertIn("/rerank", out)
+        self.assertIn("/rewrite", out)
         self.assertIn("/eval", out)
 
     def test_ask(self):
@@ -62,22 +67,32 @@ class TestCLIRag(unittest.TestCase):
 
     def test_ask_compare(self):
         _, out = handle_command('/ask-compare "Вопрос" --index idx', self.app)
-        self.assertIn("--- Ответ без RAG ---", out)
-        self.assertIn("--- Ответ с RAG ---", out)
+        self.assertIn("--- no_rag ---", out)
+        self.assertIn("--- rag_no_rerank ---", out)
+        self.assertIn("--- rag (с reranker) ---", out)
+
+    def test_rerank_test(self):
+        _, out = handle_command('/rerank test "запрос" --index idx --reranker threshold', self.app)
+        self.assertIn("До фильтра", out)
+        self.assertIn("После фильтра", out)
+
+    def test_rewrite_test(self):
+        _, out = handle_command('/rewrite test "Что такое ТС ПИоТ" --provider heuristic', self.app)
+        self.assertIn("Оригинал:", out)
+        self.assertIn("Переписан:", out)
 
     def test_eval_report(self):
         from src.evaluation.questions import Question
-        from src.evaluation.runner import save_results
+        from src.evaluation.runner import QuestionResult, save_results
         from src.models import Chunk
         from src.rag.models import RAGResult
         from src.retrieval.models import RetrievedChunk
 
         rc = RetrievedChunk(Chunk("c0", "a.md", "a", "t", 0, 4, "fixed", "s"), 0.9, 1)
         q = Question("q01", "Вопрос", "ответ", ["a.md"])
-        rag = RAGResult("ответ", "rag", [rc], "", {"elapsed_ms": 1, "tokens_in": 2, "tokens_out": 1})
-        no_rag = RAGResult("не знаю", "no_rag", [], "", {"elapsed_ms": 1, "tokens_in": 1, "tokens_out": 1})
-        from src.evaluation.runner import QuestionResult
-        json_path, _, _ = save_results([QuestionResult(q, rag, no_rag)], self.root / "results", "idx")
+        rag = RAGResult("ответ", "rag", [rc], chunks_before_rerank=[rc], chunks_after_rerank=[rc], meta={"elapsed_ms": 1, "tokens_in": 2, "tokens_out": 1})
+        no_rag = RAGResult("не знаю", "no_rag", [], meta={"elapsed_ms": 1, "tokens_in": 1, "tokens_out": 1})
+        json_path, _, _ = save_results([QuestionResult(q, {"rag": rag, "no_rag": no_rag})], self.root / "results", "idx", modes=["rag", "no_rag"])
 
         _, out = handle_command(f'/eval report {json_path.as_posix()} --format console', self.app)
         self.assertIn("Отчёт об оценке", out)
@@ -85,3 +100,4 @@ class TestCLIRag(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -1,15 +1,16 @@
-# Week1Task22 — Первый RAG-запрос
+# Week1Task23 — Реранкинг и фильтрация
 
-Расширение проекта Week1Task21: локальный пайплайн индексации + RAG-агент.
+Расширение проекта Week1Task21–22: локальный пайплайн индексации + RAG + reranking/query rewrite.
 
-Папка проекта — `C:\II\Week 1 Task 21` (продолжение Task 21, публикация в отдельный репозиторий Week1Task22).
+Папка проекта — `C:\II\Week 1 Task 21` (продолжение, публикация в отдельный репозиторий Week1Task23).
 
 Возможности:
 
-1. Индексация документов (Task 21): загрузка, чанкинг (`fixed_size` / `structural`), эмбеддинги `nomic-ai/nomic-embed-text-v2-moe`, FAISS + SQLite, статистика;
-2. RAG-запрос (Task 22): вопрос → поиск релевантных чанков → промт → DeepSeek → ответ;
-3. Два режима: ответ LLM **с RAG** и **без RAG**;
-4. Контрольные вопросы (`questions.yaml`) и сравнение качества (эвристики, без LLM-as-judge).
+1. Индексация документов (Task 21): загрузка, чанкинг (`fixed_size` / `structural`), эмбеддинги `nomic-ai/nomic-embed-text-v2-moe` (префиксы `search_document:` / `search_query:`), FAISS + SQLite, статистика;
+2. RAG-запрос (Task 22): вопрос → retrieval → промт → DeepSeek → ответ; два режима (с RAG / без RAG) + контрольные вопросы;
+3. Реранкинг/фильтрация (Task 23): порог similarity (threshold), эвристический пересчёт (similarity), опционально cross-encoder;
+4. Query rewrite (Task 23): none (по умолчанию), heuristic, llm (DeepSeek);
+5. Настраиваемые `top_k_retrieve` и `top_k_after_rerank`, сравнение режимов в `/eval`.
 
 Интерфейс — только CLI (интерактивный REPL), без web. PDF не поддерживаются.
 
@@ -40,8 +41,8 @@ C:\II\Week 1 Task 21\
 │   ├── stats/               # chunk_stats (метрики + форматы console/json/csv/markdown)
 │   ├── llm/                 # LLMProvider, deepseek_provider
 │   ├── retrieval/           # Retriever, VectorRetriever, RetrievedChunk
-│   ├── reranking/           # заглушка (задел на День 23)
-│   ├── rag/                 # RAGPipeline, NoRAGPipeline, prompt_builder, citations (заглушка)
+│   ├── reranking/           # Reranker, ThresholdFilter, SimilarityReranker, CrossEncoderReranker, RerankerPipeline
+│   ├── rag/                 # RAGPipeline, NoRAGPipeline, prompt_builder, query_rewrite, citations (заглушка)
 │   ├── evaluation/          # вопросы, генерация, прогон, эвристики, отчёты
 │   ├── chat/                # заглушка (задел на День 25)
 │   └── cli/                 # main.py (REPL), commands.py (единый источник описаний)
@@ -115,12 +116,14 @@ python -m src.cli.main
 | `/index show-chunk <name> <chunk_id>` | Полный текст + метаданные чанка |
 | `/index list-chunks <name> [--source ...] [--section ...] [--limit N]` | Список чанков с фильтрами |
 | `/index delete <name>` | Удалить индекс |
-| `/ask "<вопрос>" [--index <name>] [--top-k N] [--debug]` | RAG-ответ + источники |
+| `/ask "<вопрос>" [--index <name>] [--top-k-retrieve N] [--top-k-after-rerank N] [--reranker threshold\|similarity\|cross_encoder\|none] [--rewrite none\|heuristic\|llm] [--debug]` | RAG-ответ + источники |
 | `/ask-raw "<вопрос>" [--debug]` | Ответ LLM без RAG |
-| `/ask-compare "<вопрос>" [--index <name>] [--top-k N]` | Оба режима рядом |
+| `/ask-compare "<вопрос>" [--index <name>] [--top-k-retrieve N]` | Режимы рядом: no_rag \| rag_no_rerank \| rag |
+| `/rerank test "<запрос>" [--index <name>] [--top-k-retrieve N] [--reranker ...]` | Чанки до/после фильтра (без LLM) |
+| `/rewrite test "<запрос>" [--provider none\|heuristic\|llm]` | Переписанный запрос (без retrieval) |
 | `/eval generate [--index <name>] [--count N] [--out <path>] [--force]` | Генерация контрольных вопросов |
-| `/eval run <index_name> [--questions <path>] [--top-k N]` | Прогон вопросов в двух режимах |
-| `/eval report <result_file> [--format console\|markdown\|json]` | Сравнительный отчёт |
+| `/eval run <index_name> [--questions <path>] [--mode <mode>] [--compare-all] [--top-k-retrieve N] [--top-k-after-rerank N]` | Прогон вопросов в режимах |
+| `/eval report <result_file> [--format console\|markdown\|json]` | Сравнительный отчёт по режимам |
 | `/debug on\|off` | Отладочный режим (показывает эмбеддинги и стектрейсы) |
 | `/exit` | Выход |
 
@@ -301,9 +304,62 @@ LLM получает выборку чанков (разные source/section) �
 - **source hit** (RAG) — пересечение `source`/`source#section` использованных чанков с `expected_sources`;
 - сводка — hit rate RAG/No-RAG, среднее время, средние токены.
 
-## Задел на Дни 23–25
+## Реранкинг и query rewrite (Task 23)
 
-- `src/reranking` — `rerank(chunks, query)` (День 23);
+Схема пайплайна:
+
+```
+(rewrite) → retrieval (top_k_retrieve) → (reranker) → top_k_after_rerank → prompt → LLM → ответ
+```
+
+### Реранкеры
+
+- **threshold** (по умолчанию) — отсекает чанки со score ниже `min_score` (с `min_keep`);
+- **similarity** — пересчитывает score = `w1*cosine + w2*keyword_overlap + w3*phrase_match`, сортирует, отсекает;
+- **cross_encoder** — отдельная модель `BAAI/bge-reranker-v2-m3` (~2.3 ГБ), по умолчанию выключен;
+- **none** — без реранкинга.
+
+Выбор провайдера: `config.yaml` (`reranking.provider`) или флаг `--reranker`.
+
+### Настройка порога
+
+Команда `/rerank test` показывает чанки до/после фильтра на реальных запросах:
+
+```bash
+> /rerank test "Что такое ТС ПИоТ" --index my_index --reranker threshold
+```
+
+### Query rewrite
+
+- **none** (по умолчанию) — запрос как есть;
+- **heuristic** — расширяет запрос ключевыми словами (без стоп-слов);
+- **llm** — переписывает запрос через DeepSeek.
+
+Включение: `config.yaml` (`rewrite.provider`) или флаг `--rewrite`. Проверка:
+
+```bash
+> /rewrite test "Что такое ТС ПИоТ" --provider heuristic
+```
+
+### CrossEncoder: требования к машине
+
+- CPU-режим (GPU не обязателен);
+- RAM: 8 GB минимум, 16 GB рекомендуется (с учётом nomic-embed-text-v2-moe в памяти);
+- диск: ~8 GB;
+- на CPU обработка медленная (несколько секунд на батч).
+
+### Сравнение режимов
+
+```bash
+> /eval run my_index --top-k-retrieve 10 --top-k-after-rerank 5        # no_rag, rag_no_rerank, rag
+> /eval run my_index --compare-all                                     # все 5 режимов
+> /eval report data/eval/results/<timestamp>.json
+```
+
+Режимы: `no_rag`, `rag_no_rerank`, `rag`, `rag_no_rewrite`, `rag_full`.
+
+## Задел на Дни 24–25
+
 - `src/rag/citations.py` — `extract_citations(answer, chunks)` (День 24);
 - `src/chat` — мини-чат с историей и памятью (День 25).
 

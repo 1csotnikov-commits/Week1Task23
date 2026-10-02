@@ -1,4 +1,4 @@
-"""Отрисовка отчётов об оценке (console / markdown / json)."""
+"""Отрисовка отчётов об оценке (console / markdown / json) с разбивкой по режимам."""
 
 from __future__ import annotations
 
@@ -29,67 +29,83 @@ def _short(text: str, limit: int = 180) -> str:
 
 
 def _render_console(payload: Dict[str, Any]) -> str:
-    agg = payload["aggregate"]
+    agg = payload.get("aggregate", {})
+    modes = payload.get("modes", [])
     lines = ["===== Отчёт об оценке =====", ""]
     lines.append(f"Индекс: {payload.get('index_name') or '-'}")
     lines.append(f"Время: {payload.get('timestamp') or '-'}")
+    lines.append(f"top_k_retrieve: {payload.get('top_k_retrieve')}")
+    lines.append(f"top_k_after_rerank: {payload.get('top_k_after_rerank')}")
     lines.append("")
-    lines.append("--- Сводка ---")
-    lines.append(f"Вопросов: {agg['num_questions']}")
-    lines.append(f"Hit rate RAG:    {agg['rag_hit_rate']:.2%}")
-    lines.append(f"Hit rate No-RAG: {agg['no_rag_hit_rate']:.2%}")
-    lines.append(f"Попадание в источники (RAG): {agg['source_hit_rate']:.2%}")
-    lines.append(f"Среднее время RAG / No-RAG: {agg['avg_rag_time_ms']} / {agg['avg_no_rag_time_ms']} мс")
-    lines.append(f"Средние токены (in) RAG / No-RAG: {agg['avg_rag_tokens_in']} / {agg['avg_no_rag_tokens_in']}")
+    lines.append("--- Сводка по режимам ---")
+    lines.append(f"{'Режим':<16} {'HitRate':>8} {'SrcHit':>8} {'AvgTime':>9} {'AvgTokIn':>9} {'Chunks':>14}")
+    per = agg.get("per_mode", {})
+    for mode in modes:
+        m = per.get(mode, {})
+        src = m.get("source_hit_rate")
+        src_s = f"{src:.2%}" if src is not None else "-"
+        chunks = f"{m.get('avg_chunks_before', 0)}/{m.get('avg_chunks_after', 0)}"
+        lines.append(
+            f"{mode:<16} {m.get('hit_rate', 0):>8.2%} {src_s:>8} "
+            f"{m.get('avg_time_ms', 0):>8.0f}ms {m.get('avg_tokens_in', 0):>9.1f} {chunks:>14}"
+        )
     lines.append("")
-    for row in payload["questions"]:
-        rag = row["rag"]
-        no = row["no_rag"]
+    lines.append("--- Вопросы ---")
+    for row in payload.get("questions", []):
         lines.append(f"[{row['id']}] {row['question']}")
         lines.append(f"  Ожидание: {row['expected_answer']}")
-        lines.append(f"  RAG     ({'попал' if rag['hit'] else 'мимо'}): {_short(rag['answer'])}")
         if row.get("expected_sources"):
-            src = rag["sources"]
-            lines.append(f"    Источники: {'OK' if src['hit'] else 'мимо'} ({', '.join(src['matched']) or '-'})")
-        lines.append(f"  No-RAG  ({'попал' if no['hit'] else 'мимо'}): {_short(no['answer'])}")
+            lines.append(f"  Источники: {', '.join(row['expected_sources'])}")
+        for mode in modes:
+            m = row.get("modes", {}).get(mode)
+            if not m:
+                continue
+            mark = "попал" if m["hit"] else "мимо"
+            src = m["sources"]
+            src_s = ""
+            if row.get("expected_sources"):
+                src_s = f" | источники: {'OK' if src['hit'] else 'мимо'} ({', '.join(src['matched']) or '-'})"
+            lines.append(f"  [{mode}] ({mark}): {_short(m['answer'])}{src_s}")
         lines.append("")
     return "\n".join(lines)
 
 
 def _render_markdown(payload: Dict[str, Any]) -> str:
-    agg = payload["aggregate"]
+    agg = payload.get("aggregate", {})
+    modes = payload.get("modes", [])
     lines = ["# Отчёт об оценке", ""]
     lines.append(f"- Индекс: `{payload.get('index_name') or '-'}`")
     lines.append(f"- Время: {payload.get('timestamp') or '-'}")
     lines.append("")
-    lines.append("## Сводка")
-    lines.append("| Метрика | Значение |")
-    lines.append("| --- | --- |")
-    lines.append(f"| Вопросов | {agg['num_questions']} |")
-    lines.append(f"| Hit rate RAG | {agg['rag_hit_rate']:.2%} |")
-    lines.append(f"| Hit rate No-RAG | {agg['no_rag_hit_rate']:.2%} |")
-    lines.append(f"| Попадание в источники (RAG) | {agg['source_hit_rate']:.2%} |")
-    lines.append(f"| Среднее время RAG | {agg['avg_rag_time_ms']} мс |")
-    lines.append(f"| Среднее время No-RAG | {agg['avg_no_rag_time_ms']} мс |")
+    lines.append("## Сводка по режимам")
+    lines.append("| Режим | HitRate | SrcHit | AvgTime | AvgTokIn | Chunks(before/after) |")
+    lines.append("| --- | --- | --- | --- | --- | --- |")
+    per = agg.get("per_mode", {})
+    for mode in modes:
+        m = per.get(mode, {})
+        src = m.get("source_hit_rate")
+        src_s = f"{src:.2%}" if src is not None else "-"
+        chunks = f"{m.get('avg_chunks_before', 0)}/{m.get('avg_chunks_after', 0)}"
+        lines.append(
+            f"| {mode} | {m.get('hit_rate', 0):.2%} | {src_s} | "
+            f"{m.get('avg_time_ms', 0):.0f}ms | {m.get('avg_tokens_in', 0):.1f} | {chunks} |"
+        )
     lines.append("")
-    for row in payload["questions"]:
-        rag = row["rag"]
-        no = row["no_rag"]
+    for row in payload.get("questions", []):
         lines.append(f"## {row['id']}. {row['question']}")
         lines.append("")
         lines.append(f"**Ожидание:** {row['expected_answer']}")
         if row.get("expected_sources"):
-            lines.append(f"**Ожидаемые источники:** {', '.join(row['expected_sources'])}")
+            lines.append(f"**Источники:** {', '.join(row['expected_sources'])}")
         lines.append("")
-        lines.append("**RAG** (" + ("попал" if rag["hit"] else "мимо") + "):")
-        lines.append("")
-        lines.append(f"> {rag['answer']}")
-        if row.get("expected_sources"):
+        for mode in modes:
+            m = row.get("modes", {}).get(mode)
+            if not m:
+                continue
+            mark = "попал" if m["hit"] else "мимо"
+            lines.append(f"### {mode} ({mark})")
             lines.append("")
-            lines.append(f"Использованные источники: {', '.join(rag['sources']['matched']) or '-'}")
-        lines.append("")
-        lines.append("**No-RAG** (" + ("попал" if no["hit"] else "мимо") + "):")
-        lines.append("")
-        lines.append(f"> {no['answer']}")
-        lines.append("")
+            lines.append(f"> {m['answer']}")
+            lines.append("")
     return "\n".join(lines)
+

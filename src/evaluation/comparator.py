@@ -67,66 +67,45 @@ def source_hit(used_chunks: List, expected_sources: List[str]) -> Dict[str, Any]
     return {"expected_sources": sorted(expected), "matched": matched, "hit": bool(matched)}
 
 
-def evaluate_question(qresult) -> Dict[str, Any]:
-    """Собрать строку оценки по одному вопросу (оба режима)."""
-    q = qresult.question
-    rag_score = score_answer(qresult.rag.answer, q.expected_answer)
-    no_rag_score = score_answer(qresult.no_rag.answer, q.expected_answer)
-    rag_src = source_hit(qresult.rag.used_chunks, q.expected_sources)
+def evaluate_mode(rag_result, question) -> Dict[str, Any]:
+    """Оценить ответ одного режима против ожидания вопроса."""
+    score = score_answer(rag_result.answer, question.expected_answer)
+    src = source_hit(rag_result.used_chunks, question.expected_sources)
     return {
-        "id": q.id,
-        "question": q.question,
-        "expected_answer": q.expected_answer,
-        "expected_sources": q.expected_sources,
-        "rag": {
-            "answer": qresult.rag.answer,
-            "score": rag_score,
-            "hit": is_hit(rag_score),
-            "sources": rag_src,
-            "time_ms": qresult.rag.meta.get("elapsed_ms", 0),
-            "tokens_in": qresult.rag.meta.get("tokens_in", 0),
-            "tokens_out": qresult.rag.meta.get("tokens_out", 0),
-            "used_chunks": [
-                {"chunk_id": c.chunk_id, "source": c.source, "section": c.section, "score": round(c.score, 4)}
-                for c in qresult.rag.used_chunks
-            ],
-        },
-        "no_rag": {
-            "answer": qresult.no_rag.answer,
-            "score": no_rag_score,
-            "hit": is_hit(no_rag_score),
-            "time_ms": qresult.no_rag.meta.get("elapsed_ms", 0),
-            "tokens_in": qresult.no_rag.meta.get("tokens_in", 0),
-            "tokens_out": qresult.no_rag.meta.get("tokens_out", 0),
-        },
+        "answer": rag_result.answer,
+        "score": score,
+        "hit": is_hit(score),
+        "sources": src,
+        "time_ms": rag_result.meta.get("elapsed_ms", 0),
+        "tokens_in": rag_result.meta.get("tokens_in", 0),
+        "tokens_out": rag_result.meta.get("tokens_out", 0),
+        "used_chunks": [
+            {"chunk_id": c.chunk_id, "source": c.source, "section": c.section, "score": round(c.score, 4)}
+            for c in rag_result.used_chunks
+        ],
+        "num_chunks_before": len(rag_result.chunks_before_rerank),
+        "num_chunks_after": len(rag_result.chunks_after_rerank),
     }
 
 
-def aggregate(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def aggregate_modes(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Агрегировать метрики по всем режимам (строки уже содержат 'modes')."""
     n = len(rows)
     if not n:
-        return {
-            "num_questions": 0,
-            "rag_hit_rate": 0.0,
-            "no_rag_hit_rate": 0.0,
-            "source_hit_rate": 0.0,
-            "avg_rag_time_ms": 0.0,
-            "avg_no_rag_time_ms": 0.0,
-            "avg_rag_tokens_in": 0.0,
-            "avg_no_rag_tokens_in": 0.0,
-        }
-    rag_hits = sum(1 for r in rows if r["rag"]["hit"])
-    no_rag_hits = sum(1 for r in rows if r["no_rag"]["hit"])
-    src_hit = sum(1 for r in rows if r["rag"]["sources"]["hit"] is True)
-    src_applicable = sum(1 for r in rows if r["rag"]["sources"]["hit"] is not None)
+        return {"num_questions": 0, "per_mode": {}}
 
-    return {
-        "num_questions": n,
-        "rag_hit_rate": round(rag_hits / n, 4),
-        "no_rag_hit_rate": round(no_rag_hits / n, 4),
-        "source_hit_rate": round(src_hit / src_applicable, 4) if src_applicable else 0.0,
-        "avg_rag_time_ms": round(sum(r["rag"]["time_ms"] for r in rows) / n, 1),
-        "avg_no_rag_time_ms": round(sum(r["no_rag"]["time_ms"] for r in rows) / n, 1),
-        "avg_rag_tokens_in": round(sum(r["rag"]["tokens_in"] for r in rows) / n, 1),
-        "avg_no_rag_tokens_in": round(sum(r["no_rag"]["tokens_in"] for r in rows) / n, 1),
-    }
+    modes = list(rows[0]["modes"].keys())
+    per_mode: Dict[str, Any] = {}
+    for mode in modes:
+        hits = sum(1 for r in rows if r["modes"][mode]["hit"])
+        src_hit = sum(1 for r in rows if r["modes"][mode]["sources"]["hit"] is True)
+        src_applicable = sum(1 for r in rows if r["modes"][mode]["sources"]["hit"] is not None)
+        per_mode[mode] = {
+            "hit_rate": round(hits / n, 4),
+            "source_hit_rate": round(src_hit / src_applicable, 4) if src_applicable else 0.0,
+            "avg_time_ms": round(sum(r["modes"][mode]["time_ms"] for r in rows) / n, 1),
+            "avg_tokens_in": round(sum(r["modes"][mode]["tokens_in"] for r in rows) / n, 1),
+            "avg_chunks_before": round(sum(r["modes"][mode]["num_chunks_before"] for r in rows) / n, 2),
+            "avg_chunks_after": round(sum(r["modes"][mode]["num_chunks_after"] for r in rows) / n, 2),
+        }
+    return {"num_questions": n, "per_mode": per_mode}

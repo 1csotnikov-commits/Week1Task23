@@ -10,8 +10,11 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from src.cli.commands import (
+    EVAL_MODE_CHOICES,
     FORMAT_CHOICES,
+    RERANKER_CHOICES,
     REPORT_FORMAT_CHOICES,
+    REWRITER_CHOICES,
     STRATEGY_CHOICES,
     build_help,
     list_index_subcommands,
@@ -21,12 +24,15 @@ from src.embeddings.nomic_provider import NomicProvider
 from src.evaluation.generator import generate_questions
 from src.evaluation.questions import load_questions, save_questions
 from src.evaluation.report import render_report, render_report_file
-from src.evaluation.runner import run_evaluation, save_results
+from src.evaluation.runner import ALL_MODES, DEFAULT_MODES, run_evaluation, save_results
 from src.indexing.faiss_sqlite_store import FAISSSQLiteStore
 from src.indexing.pipeline import build_index
 from src.llm.deepseek_provider import DeepSeekProvider
 from src.rag.no_rag_pipeline import NoRAGPipeline
 from src.rag.pipeline import RAGPipeline
+from src.rag.query_rewrite import NoOpRewriter, make_rewriter
+from src.reranking import make_reranker
+from src.reranking.pipeline import RerankerPipeline
 from src.retrieval.vector_retriever import VectorRetriever
 from src.stats.chunk_stats import compute_stats, render, render_compare
 
@@ -300,6 +306,26 @@ def _resolve_index(config: Config, flags: dict) -> str:
     return index
 
 
+def _resolve_reranker(app: App, flags: dict):
+    """Создать реранкер по флагу --reranker или конфигу."""
+    flag = flags.get("reranker")
+    if flag is not None:
+        return make_reranker(flag, app.config)
+    if bool(app.config.get("reranking.enabled", True)):
+        return make_reranker(app.config.get("reranking.provider", "threshold"), app.config)
+    return None
+
+
+def _resolve_rewriter(app: App, flags: dict, llm):
+    """Создать переписыватель запроса по флагу --rewrite или конфигу."""
+    flag = flags.get("rewrite")
+    if flag is not None:
+        return make_rewriter(flag, app.config, llm)
+    if bool(app.config.get("rewrite.enabled", False)):
+        return make_rewriter(app.config.get("rewrite.provider", "none"), app.config, llm)
+    return None
+
+
 def _render_questions_short(questions) -> str:
     lines = []
     for q in questions:
@@ -312,14 +338,24 @@ def _render_questions_short(questions) -> str:
 # ---------------------------------------------------------------------- #
 def _cmd_ask(app: App, args: List[str]) -> str:
     pos, flags = parse_args(args)
-    _require_positional(pos, 1, "/ask \"<вопрос>\" [--index <index_name>] [--top-k N]")
+    _require_positional(pos, 1, "/ask \"<вопрос>\" [--index <index_name>] [--top-k-retrieve N] [--reranker ...] [--rewrite ...]")
     question = pos[0]
     index_name = _resolve_index(app.config, flags)
-    top_k = int(flags["top-k"]) if flags.get("top-k") else None
+    top_k_retrieve = int(flags["top-k-retrieve"]) if flags.get("top-k-retrieve") else None
+    top_k_after = int(flags["top-k-after-rerank"]) if flags.get("top-k-after-rerank") else None
     debug = bool(flags.get("debug")) or app.debug
 
-    pipeline = RAGPipeline(_make_retriever(app, index_name), _make_llm(app.config), app.config)
-    result = pipeline.run(question, top_k=top_k)
+    llm = _make_llm(app.config)
+    reranker = _resolve_reranker(app, flags)
+    rewriter = _resolve_rewriter(app, flags, llm)
+    pipeline = RAGPipeline(_make_retriever(app, index_name), llm, app.config, reranker=reranker, rewriter=rewriter)
+    result = pipeline.run(
+        question,
+        top_k_retrieve=top_k_retrieve,
+        top_k_after_rerank=top_k_after,
+        use_reranker=reranker is not None,
+        use_rewrite=rewriter is not None,
+    )
 
     lines = ["--- Ответ (RAG) ---", result.answer, "", "--- Источники ---"]
     if not result.used_chunks:
@@ -328,13 +364,23 @@ def _cmd_ask(app: App, args: List[str]) -> str:
         lines.append(f"  [{c.rank}] {c.source} | {c.section or '-'} | {c.chunk_id} | score={c.score:.4f}")
     if debug:
         lines.append("")
+        lines.append(f"--- Rewrite: {result.rewrite_meta.get('method', 'none')} ---")
+        if result.rewritten_query:
+            lines.append(f"  Переписанный запрос: {result.rewritten_query}")
+        lines.append("")
+        lines.append(f"--- Rerank: {result.rerank_meta.get('provider', 'none')} ---")
+        lines.append(f"  Чанков до/после: {result.rerank_meta.get('before', 0)} -> {result.rerank_meta.get('after', 0)} (отсечено {result.rerank_meta.get('removed', 0)})")
+        lines.append("")
+        lines.append("--- Чанки до rerank ---")
+        for c in result.chunks_before_rerank:
+            lines.append(f"  [{c.rank}] {c.source} | {c.section or '-'} | {c.chunk_id} | score={c.score:.4f}")
+        lines.append("")
+        lines.append("--- Чанки после rerank ---")
+        for c in result.chunks_after_rerank:
+            lines.append(f"  [{c.rank}] {c.source} | {c.section or '-'} | {c.chunk_id} | score={c.score:.4f}")
+        lines.append("")
         lines.append("--- Полный промт ---")
         lines.append(result.prompt)
-        lines.append("")
-        lines.append("--- Все использованные чанки ---")
-        for c in result.used_chunks:
-            lines.append(f"\n[{c.rank}] {c.source} | {c.section or '-'} | {c.chunk_id}")
-            lines.append(c.text)
     return "\n".join(lines)
 
 
@@ -357,27 +403,106 @@ def _cmd_ask_raw(app: App, args: List[str]) -> str:
 
 def _cmd_ask_compare(app: App, args: List[str]) -> str:
     pos, flags = parse_args(args)
-    _require_positional(pos, 1, "/ask-compare \"<вопрос>\" [--index <index_name>] [--top-k N]")
+    _require_positional(pos, 1, "/ask-compare \"<вопрос>\" [--index <index_name>] [--top-k-retrieve N]")
     question = pos[0]
     index_name = _resolve_index(app.config, flags)
-    top_k = int(flags["top-k"]) if flags.get("top-k") else None
+    top_k_retrieve = int(flags["top-k-retrieve"]) if flags.get("top-k-retrieve") else None
 
     llm = _make_llm(app.config)
-    rag = RAGPipeline(_make_retriever(app, index_name), llm, app.config).run(question, top_k=top_k)
-    no_rag = NoRAGPipeline(llm, app.config).run(question)
+    reranker = _resolve_reranker(app, flags)
+    rewriter = _resolve_rewriter(app, flags, llm)
+    pipeline = RAGPipeline(_make_retriever(app, index_name), llm, app.config, reranker=reranker, rewriter=rewriter)
+    no_rag = NoRAGPipeline(llm, app.config)
 
-    lines = [f"===== Сравнение ответов =====", "", f"Вопрос: {question}", ""]
-    lines.append("--- Ответ без RAG ---")
-    lines.append(no_rag.answer)
+    no_rag_res = no_rag.run(question)
+    rag_no_rerank = pipeline.run(question, top_k_retrieve=top_k_retrieve, use_reranker=False, use_rewrite=False)
+    rag = pipeline.run(question, top_k_retrieve=top_k_retrieve, use_reranker=reranker is not None, use_rewrite=rewriter is not None)
+
+    lines = [f"===== Сравнение режимов =====", "", f"Вопрос: {question}", ""]
+    lines.append("--- no_rag ---")
+    lines.append(no_rag_res.answer)
     lines.append("")
-    lines.append("--- Ответ с RAG ---")
+    lines.append("--- rag_no_rerank ---")
+    lines.append(rag_no_rerank.answer)
+    lines.append("")
+    lines.append("--- rag (с reranker) ---")
     lines.append(rag.answer)
     lines.append("")
-    lines.append("--- Источники (RAG) ---")
+    lines.append("--- Источники (rag) ---")
     if not rag.used_chunks:
         lines.append("  (чанки не найдены)")
     for c in rag.used_chunks:
         lines.append(f"  [{c.rank}] {c.source} | {c.section or '-'} | {c.chunk_id} | score={c.score:.4f}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------- #
+# Команды /rerank, /rewrite
+# ---------------------------------------------------------------------- #
+def _cmd_rerank(app: App, args: List[str]) -> str:
+    if not args:
+        return build_help("/rerank")
+    sub = args[0]
+    rest = args[1:]
+    if sub == "test":
+        return _cmd_rerank_test(app, rest)
+    raise ValueError(f"Неизвестная подкоманда /rerank: {sub!r}. Доступно: test")
+
+
+def _cmd_rerank_test(app: App, args: List[str]) -> str:
+    pos, flags = parse_args(args)
+    _require_positional(pos, 1, "/rerank test \"<запрос>\" [--index ...] [--top-k-retrieve N] [--reranker ...]")
+    query = pos[0]
+    index_name = _resolve_index(app.config, flags)
+    k_retrieve = int(flags["top-k-retrieve"]) if flags.get("top-k-retrieve") else int(app.config.get("retrieval.top_k_retrieve", 10))
+
+    reranker = _resolve_reranker(app, flags)
+    chunks_before = _make_retriever(app, index_name).search(query, k_retrieve)
+
+    lines = [f"=== Ранкер: {reranker.name if reranker else 'none'} ===", f"Запрос: {query}", ""]
+    lines.append(f"--- До фильтра ({len(chunks_before)} чанков) ---")
+    for c in chunks_before:
+        lines.append(f"  [{c.rank}] {c.source} | {c.section or '-'} | {c.chunk_id} | score={c.score:.4f}")
+
+    if reranker is None:
+        lines.append("")
+        lines.append("Ранкер не задан (none) — фильтрация не выполнялась.")
+        return "\n".join(lines)
+
+    chunks_after, meta = RerankerPipeline(reranker).apply(chunks_before, query)
+    lines.append("")
+    lines.append(f"--- После фильтра ({meta['after']} чанков, отсечено {meta['removed']}) ---")
+    for c in chunks_after:
+        lines.append(f"  [{c.rank}] {c.source} | {c.section or '-'} | {c.chunk_id} | score={c.score:.4f}")
+    return "\n".join(lines)
+
+
+def _cmd_rewrite(app: App, args: List[str]) -> str:
+    if not args:
+        return build_help("/rewrite")
+    sub = args[0]
+    rest = args[1:]
+    if sub == "test":
+        return _cmd_rewrite_test(app, rest)
+    raise ValueError(f"Неизвестная подкоманда /rewrite: {sub!r}. Доступно: test")
+
+
+def _cmd_rewrite_test(app: App, args: List[str]) -> str:
+    pos, flags = parse_args(args)
+    _require_positional(pos, 1, "/rewrite test \"<запрос>\" [--provider none|heuristic|llm]")
+    query = pos[0]
+    provider = flags.get("provider") or app.config.get("rewrite.provider", "none")
+
+    rewriter = make_rewriter(provider, app.config, _make_llm(app.config))
+    if rewriter is None:
+        rewriter = NoOpRewriter()
+
+    result = rewriter.rewrite(query)
+    lines = [f"=== Rewrite: {result.method} ===", ""]
+    lines.append(f"Оригинал:  {result.original_query}")
+    lines.append(f"Переписан: {result.rewritten_query}")
+    if result.meta:
+        lines.append(f"Мета: {result.meta}")
     return "\n".join(lines)
 
 
@@ -392,7 +517,7 @@ def _cmd_eval(app: App, args: List[str]) -> str:
     if sub == "generate":
         return _cmd_eval_generate(app, rest)
     if sub == "run":
-        _require_positional(rest, 1, "/eval run <index_name> [--questions <path>] [--top-k N]")
+        _require_positional(rest, 1, "/eval run <index_name> [--questions <path>] [--mode <mode>] [--compare-all] [--top-k-retrieve N] [--top-k-after-rerank N]")
         pos, flags = parse_args(rest)
         return _cmd_eval_run(app, pos[0], flags)
     if sub == "report":
@@ -426,19 +551,34 @@ def _cmd_eval_generate(app: App, args: List[str]) -> str:
 
 def _cmd_eval_run(app: App, index_name: str, flags: dict) -> str:
     questions_path = flags.get("questions") or app.config.get("evaluation.questions", "data/eval/questions.yaml")
-    top_k = int(flags["top-k"]) if flags.get("top-k") else None
+    top_k_retrieve = int(flags["top-k-retrieve"]) if flags.get("top-k-retrieve") else None
+    top_k_after = int(flags["top-k-after-rerank"]) if flags.get("top-k-after-rerank") else None
 
     questions = load_questions(questions_path)
     if not questions:
         raise ValueError(f"В '{questions_path}' нет вопросов.")
 
     llm = _make_llm(app.config)
-    rag = RAGPipeline(_make_retriever(app, index_name), llm, app.config)
+    reranker = _resolve_reranker(app, flags)
+    rewriter = _resolve_rewriter(app, flags, llm)
+    rag = RAGPipeline(_make_retriever(app, index_name), llm, app.config, reranker=reranker, rewriter=rewriter)
     no_rag = NoRAGPipeline(llm, app.config)
 
-    results = run_evaluation(questions, rag, no_rag, top_k=top_k)
+    if flags.get("compare-all"):
+        modes = list(ALL_MODES)
+    elif flags.get("mode"):
+        mode = flags["mode"]
+        if mode not in EVAL_MODE_CHOICES:
+            raise ValueError(f"Неизвестный режим: {mode!r}. Доступно: {', '.join(EVAL_MODE_CHOICES)}")
+        modes = [mode]
+    else:
+        modes = list(DEFAULT_MODES)
+
+    results = run_evaluation(questions, rag, no_rag, modes, app.config, top_k_retrieve=top_k_retrieve, top_k_after_rerank=top_k_after)
     results_dir = app.config.resolve_path(app.config.get("evaluation.results_dir", "data/eval/results"))
-    json_path, md_path, payload = save_results(results, results_dir, index_name=index_name, top_k=top_k)
+    json_path, md_path, payload = save_results(
+        results, results_dir, index_name=index_name, top_k_retrieve=top_k_retrieve, top_k_after_rerank=top_k_after, modes=modes
+    )
 
     return render_report(payload, "console") + f"\n\nСохранено:\n  {json_path}\n  {md_path}"
 
@@ -476,6 +616,10 @@ def handle_command(line: str, app: App) -> Tuple[bool, str]:
         return False, _cmd_ask_raw(app, args)
     if cmd == "/ask-compare":
         return False, _cmd_ask_compare(app, args)
+    if cmd == "/rerank":
+        return False, _cmd_rerank(app, args)
+    if cmd == "/rewrite":
+        return False, _cmd_rewrite(app, args)
     if cmd == "/eval":
         return False, _cmd_eval(app, args)
 
